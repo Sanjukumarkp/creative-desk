@@ -36,18 +36,65 @@ Compliance rules you always follow, because these ads are often for dietary supp
 - No "FDA approved", no "clinically proven" unless that exact claim is in the brief's approved claims, no guaranteed or absolute results, no specific weight-loss numbers, no before/after framing.
 - Never contradict the brief's "never say" list. Stay inside its approved claims.`
 
+/** Structured outputs require every object to forbid extra keys. */
+function strict(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(strict)
+  if (!schema || typeof schema !== 'object') return schema
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(schema)) out[k] = strict(v)
+  if (out.type === 'object' && !('additionalProperties' in out)) out.additionalProperties = false
+  return out
+}
+
+/** Pulls the JSON object out of a text reply, tolerating code fences or a stray sentence around it. */
+function parseJson<T>(text: string): T {
+  const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim()
+  try {
+    return JSON.parse(cleaned) as T
+  } catch {
+    const start = cleaned.indexOf('{')
+    const end = cleaned.lastIndexOf('}')
+    if (start >= 0 && end > start) return JSON.parse(cleaned.slice(start, end + 1)) as T
+    throw new Error('Claude did not return valid JSON. Try again.')
+  }
+}
+
+function replyText(res: Anthropic.Message) {
+  return res.content
+    .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+    .map((b) => b.text)
+    .join('')
+}
+
+/**
+ * Asks Claude for a JSON object matching the tool's schema. Uses structured outputs, which current models
+ * support; if a model rejects that option, falls back to asking for plain JSON and parsing the reply.
+ */
 async function callTool<T>(opts: { prompt: string; tool: Anthropic.Tool; maxTokens?: number }): Promise<T> {
-  const res = await client().messages.create({
+  const schema = strict(opts.tool.input_schema) as Record<string, unknown>
+  const base = {
     model: MODEL,
     max_tokens: opts.maxTokens ?? 4000,
     system: SYSTEM,
-    tools: [opts.tool],
-    tool_choice: { type: 'tool', name: opts.tool.name },
-    messages: [{ role: 'user', content: opts.prompt }],
-  })
-  const block = res.content.find((b) => b.type === 'tool_use')
-  if (!block || block.type !== 'tool_use') throw new Error('Claude did not return structured output. Try again.')
-  return block.input as T
+    messages: [{ role: 'user' as const, content: opts.prompt }],
+  }
+  try {
+    const res = await client().messages.create({ ...base, output_config: { format: { type: 'json_schema', schema } } })
+    return parseJson<T>(replyText(res))
+  } catch (err) {
+    const status = (err as { status?: number }).status
+    if (status !== 400 || err instanceof AiNotConfigured) throw err
+    const res = await client().messages.create({
+      ...base,
+      messages: [
+        {
+          role: 'user',
+          content: `${opts.prompt}\n\nReply with only a JSON object (no other text) that matches this JSON schema:\n${JSON.stringify(schema)}`,
+        },
+      ],
+    })
+    return parseJson<T>(replyText(res))
+  }
 }
 
 const conceptProps = {
